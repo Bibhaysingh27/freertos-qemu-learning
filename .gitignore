@@ -1,0 +1,25 @@
+
+# Compiled object files
+*.o
+*.obj
+
+# Firmware output files
+*.elf
+*.bin
+*.hex
+
+# Map and listing files
+*.map
+*.lst
+
+# Debugger and emulator generated files
+*.log
+*.core
+
+# Build directories
+build/
+out/
+
+# Temporary files
+*.tmp
+*~
