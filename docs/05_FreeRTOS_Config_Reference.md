@@ -684,5 +684,261 @@ For our project, we will implement an assertion handler that stops execution so 
 | FreeRTOSConfig.h | Pending |
 | First FreeRTOS build | Pending |
 
+
+
+# 12. FreeRTOS Port Bring-up and Hardware Verification
+
+## 12.1 Development Environment Verification
+
+Verified development environment:
+
+| Component | Version / Configuration |
+|---|---|
+| QEMU | 8.2.2 |
+| ARM GCC | 13.2.1 |
+| Target machine | MPS2-AN386 |
+| CPU | Cortex-M4 |
+| FreeRTOS port | GCC/ARM_CM4F |
+| Debugger | GDB Multiarch |
+| Emulator | QEMU |
+
+Bare-metal firmware successfully booted using:
+
+```bash
+qemu-system-arm -M mps2-an386 \
+-display none \
+-serial null \
+-monitor none \
+-kernel 01_bare_metal_basics/firmware.elf
+```
+
+The firmware currently executes an infinite loop, so no terminal output is expected.
+
+## 12.2 CPU and SysTick Clock Investigation
+
+QEMU MPS2-AN386 clock assumptions:
+
+| Clock | Frequency |
+|---|---:|
+| SYSCLK | 25 MHz |
+| REFCLK | 1 MHz |
+
+Proposed FreeRTOS configuration:
+
+```c
+#define configCPU_CLOCK_HZ        25000000UL
+#define configSYSTICK_CLOCK_HZ     1000000UL
+#define configTICK_RATE_HZ         100
+```
+
+The proposed RTOS tick interval is:
+
+```text
+Tick period = 1 / 100
+            = 10 ms
+```
+
+SysTick reload calculation:
+
+```text
+Reload = (1,000,000 / 100) - 1
+       = 9,999
+```
+
+Important:
+- Defining configSYSTICK_CLOCK_HZ selects the external SysTick clock source in this FreeRTOS port.
+- The actual clock connected to that source must match the configured value.
+- These values are proposed for our QEMU setup and must be validated during runtime.
+
+## 12.3 ARM Compiler and FPU Configuration
+
+ARM GCC version:
+
+```text
+13.2.1
+```
+
+Existing bare-metal compiler flags:
+
+```makefile
+-mcpu=cortex-m4
+-mthumb
+```
+
+Proposed FreeRTOS Cortex-M4F flags:
+
+```makefile
+-mcpu=cortex-m4 \
+-mthumb \
+-mfpu=fpv4-sp-d16 \
+-mfloat-abi=softfp
+```
+
+Compiler multilib verification:
+
+```bash
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb \
+-mfpu=fpv4-sp-d16 -mfloat-abi=softfp \
+-print-multi-directory
+```
+
+Expected output:
+
+```text
+thumb/v7e-m+fp/softfp
+```
+
+This confirms GCC supports the selected Cortex-M4F softfp compilation target.
+
+## 12.4 FPU Hardware and Access Verification
+
+FPU-related registers were inspected using GDB.
+
+| Register | Address | Observed value |
+|---|---|---|
+| MVFR0 | 0xE000EF40 | 0x10110021 |
+| MVFR1 | 0xE000EF44 | 0x11000011 |
+| MVFR2 | 0xE000EF48 | 0x00000000 |
+| CPACR | 0xE000ED88 | 0x00000000 |
+
+CPACR controls access to the FPU.
+
+Relevant bits:
+
+- CP10: bits 20–21
+- CP11: bits 22–23
+
+Full access requires both fields to be set to 0b11.
+
+Required bit mask:
+
+```c
+(0xFUL << 20)
+```
+
+At reset, CPACR was observed as zero, indicating that FPU access was disabled.
+
+### FreeRTOS FPU initialization
+
+The GCC ARM_CM4F port contains:
+
+```c
+static void vPortEnableVFP(void)
+{
+    __asm volatile
+    (
+        "ldr.w r0, =0xE000ED88\n"
+        "ldr r1, [r0]\n"
+        "orr r1, r1, #(0xf << 20)\n"
+        "str r1, [r0]\n"
+        "bx r14\n"
+    );
+}
+```
+
+The scheduler startup calls:
+
+```c
+vPortEnableVFP();
+```
+
+It subsequently enables automatic and lazy floating-point context preservation:
+
+```c
+*(portFPCCR) |= portASPEN_AND_LSPEN_BITS;
+```
+
+Therefore, the FreeRTOS port already provides FPU initialization. We do not need to add duplicate FPU initialization to startup.c for this integration.
+
+Note: Runtime verification of FPU access after scheduler startup is still pending.
+
+## 12.5 FreeRTOS Exception Handler Configuration
+
+The Cortex-M4F port uses three important exception handlers:
+
+| Handler | Vector table index | Purpose |
+|---|---:|---|
+| SVC | 11 | Start the first task |
+| PendSV | 14 | Perform task context switching |
+| SysTick | 15 | Maintain RTOS tick |
+
+The existing bare-metal vector table currently uses Default_Handler for these entries.
+
+During FreeRTOS integration, these entries must be connected to:
+
+```c
+vPortSVCHandler
+xPortPendSVHandler
+xPortSysTickHandler
+```
+
+The port also checks SVC and PendSV vector installation when handler-installation checking is enabled.
+
+## 12.6 NVIC Priority Detection
+
+The FreeRTOS ARM_CM4F port contains runtime priority-bit detection.
+
+Its logic:
+
+1. Save the original first user interrupt priority register.
+2. Write 0xFF to the register.
+3. Read the value back.
+4. Determine which priority bits are implemented.
+5. Validate configMAX_SYSCALL_INTERRUPT_PRIORITY.
+6. Restore the original priority register.
+
+Example if hardware implements four priority bits:
+
+```text
+Written: 11111111
+Read:    11110000
+```
+
+This corresponds to a priority mask of:
+
+```c
+0xF0
+```
+
+With four priority bits, the proposed syscall threshold is:
+
+```c
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY 0x50
+```
+
+This represents logical interrupt priority 5.
+
+Important rules:
+
+- Lower numerical priority means higher urgency.
+- Priority 0 interrupts cannot be masked using BASEPRI.
+- Interrupts with higher urgency than the syscall threshold must not call FreeRTOS APIs.
+- Interrupts permitted to use the kernel must use the appropriate FromISR APIs.
+- Priority grouping must be configured consistently with FreeRTOS requirements.
+
+**Status:** Four priority bits and the 0x50 threshold are proposed, pending runtime validation on QEMU.
+
+## 12.7 Verification Status
+
+| Item | Status |
+|---|---|
+| QEMU 8.2.2 | Verified |
+| Cortex-M4 target | Verified |
+| ARM GCC 13.2.1 | Verified |
+| Cortex-M4F compiler multilib | Verified |
+| Bare-metal firmware boot | Verified |
+| FPU feature registers inspected | Verified |
+| FPU access disabled at reset | Verified |
+| FreeRTOS FPU initialization identified | Verified in source |
+| Lazy FPU context preservation identified | Verified in source |
+| SysTick configuration understood | Verified in source |
+| NVIC priority detection understood | Verified in source |
+| Runtime FPU access after scheduler startup | Pending |
+| Runtime NVIC priority-bit validation | Pending |
+| FreeRTOSConfig.h implementation | Pending |
+| First FreeRTOS build | Pending |
+
+
+
 **Documentation rule:** Never treat a proposed configuration as a verified runtime result. Update this table after successful compilation and debugging.
 
